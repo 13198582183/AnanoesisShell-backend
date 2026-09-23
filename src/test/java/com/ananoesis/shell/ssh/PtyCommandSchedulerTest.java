@@ -53,6 +53,17 @@ class PtyCommandSchedulerTest {
         return new PtyCommandScheduler(terminal, NONCE, executor, timeoutMs, watchMs, maxAbsoluteMs);
     }
 
+    /** 创建含 busy 自愈时限的调度器（MANUAL_BUSY 死锁修复专项）。 */
+    private PtyCommandScheduler createSchedulerWithBusyExpire(long busyExpireMs) {
+        return createSchedulerWithBusyExpire(200, busyExpireMs);
+    }
+
+    /** 指定命令超时与 busy 自愈时限（自愈类用例需长命令超时，避免 sleep 期间 watchdog 误中断）。 */
+    private PtyCommandScheduler createSchedulerWithBusyExpire(long timeoutMs, long busyExpireMs) {
+        return new PtyCommandScheduler(terminal, NONCE, executor, timeoutMs, 150,
+                PtyCommandScheduler.DEFAULT_MAX_ABSOLUTE_MS, busyExpireMs);
+    }
+
     // ==================================================================
     // 状态机
     // ==================================================================
@@ -121,19 +132,6 @@ class PtyCommandSchedulerTest {
             scheduler.submitCommand("pwd");
             scheduler.onFrame(new ShellFrame(ShellFrameType.CWD, NONCE, "c1", "/var/log"));
             assertThat(scheduler.sessionCwd()).isEqualTo("/var/log");
-        }
-
-        @Test
-        @DisplayName("manual_busy 时提交命令被拒绝")
-        void submitRejectedWhenManualBusy() {
-            PtyCommandScheduler scheduler = createScheduler();
-            scheduler.onIntegrationSuccess();
-            scheduler.onManualBusy();
-
-            CompletableFuture<PtyCommandScheduler.CommandResult> future =
-                    scheduler.submitCommand("echo hello");
-
-            assertThat(future).isCompletedExceptionally();
         }
 
         @Test
@@ -507,8 +505,8 @@ class PtyCommandSchedulerTest {
     class ManualIntervention {
 
         @Test
-        @DisplayName("onManualBusy 阻止 Agent 提交")
-        void manualBusyBlocksAgentSubmit() {
+        @DisplayName("onManualBusy 期间 Agent 提交排队而非拒绝（旧拒绝语义是 MANUAL_BUSY 死锁闭环的一环）")
+        void manualBusyQueuesAgentSubmit() {
             PtyCommandScheduler scheduler = createScheduler();
             scheduler.onIntegrationSuccess();
 
@@ -516,7 +514,9 @@ class PtyCommandSchedulerTest {
 
             CompletableFuture<PtyCommandScheduler.CommandResult> future =
                     scheduler.submitCommand("echo hello");
-            assertThat(future).isCompletedExceptionally();
+            // 新语义：不被拒、也不立即发送（人工忙碌不得注入），排队等待自愈/恢复派发
+            assertThat(future).isNotCompletedExceptionally();
+            assertThat(future).isNotDone();
             assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_BUSY);
         }
 
@@ -554,6 +554,117 @@ class PtyCommandSchedulerTest {
             CompletableFuture<PtyCommandScheduler.CommandResult> future =
                     scheduler.submitCommand("pwd");
             assertThat(future).isNotCompletedExceptionally();
+        }
+    }
+
+    // ==================================================================
+    // MANUAL_BUSY 自愈（停止后卡死 bug）
+    // ==================================================================
+
+    @Nested
+    @DisplayName("MANUAL_BUSY 自愈过期")
+    class ManualBusySelfHeal {
+
+        @Test
+        @DisplayName("无后续按键时 busy 到期自动回到 idle（旧设计唯一恢复证据是 PROMPT 帧，半行输入后用户停手即永久卡死）")
+        void busySelfHealsToIdleAfterQuietPeriod() throws Exception {
+            PtyCommandScheduler scheduler = createSchedulerWithBusyExpire(250);
+            scheduler.onIntegrationSuccess();
+
+            scheduler.onManualBusy();
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_BUSY);
+
+            // 静默超过 busyExpire → 自愈回 idle
+            Thread.sleep(500);
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
+        }
+
+        @Test
+        @DisplayName("busy 期间提交的命令排队而非拒绝；自愈后先 Ctrl-C 清疑似半行再派发（参照现行 ssh 客户端注入前清行）")
+        void submitWhileBusyQueuesAndDispatchesAfterSelfHeal() throws Exception {
+            // 命令超时 5s：自愈后的 sleep + 断言窗口内 watchdog 不会 interrupt 在飞的 pwd
+            PtyCommandScheduler scheduler = createSchedulerWithBusyExpire(5000, 250);
+            scheduler.onIntegrationSuccess();
+
+            scheduler.onManualBusy();
+            CompletableFuture<PtyCommandScheduler.CommandResult> future =
+                    scheduler.submitCommand("pwd");
+            // 排队：未被拒绝、也未立即发送（人工忙碌不得注入）
+            assertThat(future).isNotCompletedExceptionally();
+            assertThat(future).isNotDone();
+            assertThat(terminal.sentData).noneMatch(s -> s.startsWith("pwd"));
+
+            Thread.sleep(500);
+            // 自愈后：先 Ctrl-C 清行，再派发排队命令（须在 200ms 命令超时前断言，
+            // 否则 watchdog 会中断在飞命令补发 Ctrl-C）
+            assertThat(terminal.sentData).containsExactly("\u0003", "pwd\n");
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.AGENT_OWNED);
+
+            // 命令正常完成，避免悬挂的在飞命令被超时中断干扰断言
+            scheduler.onFrame(new ShellFrame(ShellFrameType.CMD_END, NONCE, "1", "0"));
+            scheduler.onFrame(new ShellFrame(ShellFrameType.PROMPT, NONCE, "1", ""));
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
+        }
+
+        @Test
+        @DisplayName("busy 期间用户前台命令在跑（CMD_START 证据）不自愈不清行，恢复仍靠 PROMPT 链路")
+        void runningForegroundCommandIsNotSelfHealed() throws Exception {
+            PtyCommandScheduler scheduler = createSchedulerWithBusyExpire(200);
+            scheduler.onIntegrationSuccess();
+
+            scheduler.onManualBusy();
+            // 用户按了回车，命令开始执行（trap DEBUG 上报 CMD_START）——
+            // 此时若自愈发 Ctrl-C 会杀死用户的前台/全屏程序
+            scheduler.onFrame(new ShellFrame(ShellFrameType.CMD_START, NONCE, "manual", "sleep 60"));
+
+            Thread.sleep(500);
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_BUSY);
+            assertThat(terminal.sentData).doesNotContain("\u0003");
+
+            // 前台命令结束，PROMPT 帧恢复 idle（既有路径不受影响）
+            scheduler.onFrame(new ShellFrame(ShellFrameType.CMD_END, NONCE, "manual", "0"));
+            scheduler.onFrame(new ShellFrame(ShellFrameType.PROMPT, NONCE, "manual", ""));
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
+        }
+
+        @Test
+        @DisplayName("PROMPT 正常恢复时取消自愈任务，不再补发多余 Ctrl-C")
+        void promptRecoveryCancelsSelfHeal() throws Exception {
+            PtyCommandScheduler scheduler = createSchedulerWithBusyExpire(300);
+            scheduler.onIntegrationSuccess();
+
+            // 第一次 busy：调度旧自愈任务（t≈10 到期于 t≈310）
+            scheduler.onManualBusy();
+            // PROMPT 恢复——必须取消旧任务，否则其在第二次 busy 窗口内到期会误清行
+            scheduler.onFrame(new ShellFrame(ShellFrameType.PROMPT, NONCE, "manual", ""));
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
+            terminal.sentData.clear();
+
+            // 制造新旧窗口差：旧任务未取消会在 t≈310 触发；新任务到期于 t≈560
+            Thread.sleep(250);
+            scheduler.onManualBusy();
+            Thread.sleep(250);
+            // t≈510：若旧任务未取消，已在 t≈310（此时处于第二次 busy）误发 Ctrl-C 并提前回 idle
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_BUSY);
+            assertThat(terminal.sentData).doesNotContain("\u0003");
+        }
+
+        @Test
+        @DisplayName("连续按键刷新自愈计时：过期时刻从最后一次按键起算")
+        void continuousKeystrokesPushOutExpiry() throws Exception {
+            PtyCommandScheduler scheduler = createSchedulerWithBusyExpire(300);
+            scheduler.onIntegrationSuccess();
+
+            scheduler.onManualBusy();
+            Thread.sleep(150);
+            // 用户仍在打字（input 帧持续到达）→ 重新计时
+            scheduler.onManualBusy();
+            Thread.sleep(200);
+            // 距第二次按键仅 200ms < 300ms，不得提前自愈
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_BUSY);
+
+            Thread.sleep(250);
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
         }
     }
 

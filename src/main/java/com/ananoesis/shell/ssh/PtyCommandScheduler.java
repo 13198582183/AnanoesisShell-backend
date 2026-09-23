@@ -27,6 +27,10 @@ import org.slf4j.LoggerFactory;
  *       64 KiB 采集上限（BUG-A 改造：分钟级安装命令持续输出时不得被误杀）</li>
  *   <li>超限继续排空、仅丢弃超额采集内容</li>
  *   <li>中断后 3 秒无完成证据 → {@code unknown}</li>
+ *   <li>manual_busy 自愈：用户停手超过 busy 时限且无前台命令在跑（无 CMD_START
+ *       证据）时清行回 idle（修复：停止回合后键盘活动把状态标 busy，而 busy 的
+ *       旧唯一恢复证据是下一条命令的 PROMPT 帧——Agent 提交又被 busy 拒绝不发命令，
+ *       形成"拒绝→无帧→永久 busy"死锁，获准命令全被拒、模型重复思考不执行）</li>
  * </ul>
  *
  * <p>WHY 串行而非并行：PTY 是共享的 stdin/stdout，并发写入会让命令输出交错，
@@ -54,6 +58,19 @@ public class PtyCommandScheduler {
 
     /** 等待方（runner/tools）future.get 相对绝对上限的余量（秒），避免提前弃等回落 exec。 */
     private static final long PTY_WAIT_GRACE_SECONDS = 10;
+
+    /**
+     * MANUAL_BUSY 自愈时限：最后一次人工按键后静默超过此时长且无前台命令在跑，
+     * 视为人工活动结束，清行回 idle。
+     *
+     * <p>WHY 需要自愈（停止后卡死 bug）：busy 的旧唯一恢复证据是 PROMPT 帧，
+     * 而 PROMPT 只在有命令真正执行完时才出现；用户在空提示符敲了半行后停手转去
+     * 审批 Agent 命令，就落入"busy 拒绝提交→不发命令→无 PROMPT→永久 busy"的
+     * 结构性死锁。现行成熟 ssh 客户端从不用"是否敲过键"无限期封锁自动执行，
+     * 而是在注入前清掉残留半行。10 秒取值：覆盖正常打字停顿（连续按键会重置计时），
+     * 又不至于让获准命令等太久。</p>
+     */
+    static final long DEFAULT_BUSY_EXPIRE_MS = 10_000;
 
     /** design.md D3：64 KiB 单命令采集上限。 */
     static final int MAX_COLLECTION_BYTES = 65536;
@@ -112,6 +129,9 @@ public class PtyCommandScheduler {
     /** 单条命令绝对执行上限（防跑飞兜底，与是否活跃无关）。 */
     private final long maxAbsoluteMs;
 
+    /** MANUAL_BUSY 自愈时限（见 {@link #DEFAULT_BUSY_EXPIRE_MS}）。 */
+    private final long busyExpireMs;
+
     // ==================================================================
     // 运行时状态
     // ==================================================================
@@ -127,6 +147,9 @@ public class PtyCommandScheduler {
 
     /** 中断后观察窗口定时任务（可取消）。 */
     private ScheduledFuture<?> pendingWatch;
+
+    /** busy 自愈定时任务（每次人工按键重新调度，可取消）。 */
+    private ScheduledFuture<?> pendingBusyExpire;
 
     /** 是否已收到 CMD_END（用于判断 PROMPT 是否标志着命令完成）。 */
     private boolean cmdEndReceived;
@@ -178,12 +201,29 @@ public class PtyCommandScheduler {
                                long timeoutMs,
                                long interruptWatchMs,
                                long maxAbsoluteMs) {
+        this(terminalSession, expectedNonce, scheduler, timeoutMs, interruptWatchMs,
+                maxAbsoluteMs, DEFAULT_BUSY_EXPIRE_MS);
+    }
+
+    /**
+     * 构造调度器（含 busy 自愈时限的全参构造——供测试使用）。
+     *
+     * @param busyExpireMs MANUAL_BUSY 静默自愈时限（毫秒）
+     */
+    public PtyCommandScheduler(SshTerminalSession terminalSession,
+                               String expectedNonce,
+                               ScheduledExecutorService scheduler,
+                               long timeoutMs,
+                               long interruptWatchMs,
+                               long maxAbsoluteMs,
+                               long busyExpireMs) {
         this.terminalSession = Objects.requireNonNull(terminalSession, "terminalSession 不得为 null");
         this.expectedNonce = Objects.requireNonNull(expectedNonce, "expectedNonce 不得为 null");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler 不得为 null");
         this.timeoutMs = timeoutMs;
         this.interruptWatchMs = interruptWatchMs;
         this.maxAbsoluteMs = maxAbsoluteMs;
+        this.busyExpireMs = busyExpireMs;
     }
 
     // ==================================================================
@@ -250,6 +290,11 @@ public class PtyCommandScheduler {
             if (state == State.MANUAL_IDLE) {
                 state = State.MANUAL_BUSY;
             }
+            // WHY 每次按键重排而非仅首次：自愈过期从最后一次按键起算，
+            // 连续打字（粘贴同理）期间不会被中途清行打断
+            if (state == State.MANUAL_BUSY) {
+                scheduleBusyExpire();
+            }
         }
     }
 
@@ -263,9 +308,47 @@ public class PtyCommandScheduler {
         synchronized (this) {
             if (state == State.MANUAL_BUSY) {
                 state = State.MANUAL_IDLE;
+                cancelBusyExpire();
                 // WHY 尝试派发：可能有人工忙碌期间排队的命令等待执行
                 tryDispatchNext();
             }
+        }
+    }
+
+    /** 调度（或重排）busy 自愈任务：静默到期后若仍无 PROMPT 恢复证据则清行回 idle。 */
+    private void scheduleBusyExpire() {
+        cancelBusyExpire();
+        pendingBusyExpire = scheduler.schedule(
+                this::onBusyExpired, busyExpireMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** 取消 busy 自愈任务（PROMPT 恢复/前台命令在跑/显式 idle/停止时调用）。 */
+    private void cancelBusyExpire() {
+        if (pendingBusyExpire != null) {
+            pendingBusyExpire.cancel(false);
+            pendingBusyExpire = null;
+        }
+    }
+
+    /**
+     * busy 自愈到期：用户停手超过 busyExpireMs 且无前台命令在跑。
+     *
+     * <p>发 Ctrl-C 清除疑似残留半行（参照现行 ssh 客户端注入前清行；空提示符上
+     * Ctrl-C 只会产生新提示符，无副作用），再回 manual_idle 并派发排队命令，
+     * 打破"busy 拒绝提交→不发命令→无 PROMPT→永久 busy"死锁。</p>
+     */
+    private void onBusyExpired() {
+        synchronized (this) {
+            // currentCommand != null 说明 Agent 命令在飞（state 应为 AGENT_OWNED），
+            // 不在自愈范围内；STOPPING/UNKNOWN 同样不自愈
+            if (state != State.MANUAL_BUSY || currentCommand != null) {
+                return;
+            }
+            LOG.info("manual_busy 静默到期，清除疑似半行后自愈回 manual_idle");
+            terminalSession.send(CTRL_C);
+            state = State.MANUAL_IDLE;
+            pendingBusyExpire = null;
+            tryDispatchNext();
         }
     }
 
@@ -280,6 +363,7 @@ public class PtyCommandScheduler {
             state = State.STOPPING;
             cancelTimeout();
             cancelWatch();
+            cancelBusyExpire();
             if (currentCommand != null) {
                 terminalSession.send(CTRL_C);
             }
@@ -303,6 +387,7 @@ public class PtyCommandScheduler {
      * <ul>
      *   <li>{@code manual_idle}：立即领取输入权，发送命令</li>
      *   <li>{@code agent_owned}：排队等待当前命令完成</li>
+     *   <li>{@code manual_busy}：排队等待自愈（旧语义直接拒绝是死锁闭环的一环）</li>
      *   <li>其他状态：拒绝，返回已完成的异常 future</li>
      * </ul>
      *
@@ -320,6 +405,10 @@ public class PtyCommandScheduler {
                 case MANUAL_IDLE:
                     return dispatchCommand(command);
                 case AGENT_OWNED:
+                    return enqueueCommand(command);
+                case MANUAL_BUSY:
+                    // WHY 排队而非拒绝：busy 可能来自无命令可跑的半行，拒绝会形成
+                    // "拒绝→无 PROMPT→永久 busy"死锁；排队后由自愈到期或 PROMPT 恢复派发
                     return enqueueCommand(command);
                 default:
                     return failedFuture(new IllegalStateException(
@@ -451,6 +540,11 @@ public class PtyCommandScheduler {
         // 但不改变状态机的转换——派发时已进入 agent_owned
         if (currentCommand != null) {
             LOG.trace("CMD_START: cmdId={}", frame.commandId());
+        } else if (state == State.MANUAL_BUSY) {
+            // busy 且无 Agent 命令在飞时收到 CMD_START = 用户前台命令在跑
+            // （如 top/vim/嵌套 Shell），取消自愈——否则 Ctrl-C 会杀死用户程序，
+            // 恢复重新依赖 PROMPT 链路（用例③语义）
+            cancelBusyExpire();
         }
     }
 
@@ -496,6 +590,8 @@ public class PtyCommandScheduler {
             // 后续获准命令全被拒（Shell → Agent 交接失效的根因之一）
             if (state == State.MANUAL_BUSY) {
                 state = State.MANUAL_IDLE;
+                // PROMPT 是比自愈更强的恢复证据，取消待触发的清行任务
+                cancelBusyExpire();
                 // 可能有人工忙碌期间排队的命令等待执行
                 tryDispatchNext();
             }
