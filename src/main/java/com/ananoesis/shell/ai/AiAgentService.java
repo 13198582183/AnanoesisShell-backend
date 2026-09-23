@@ -30,6 +30,7 @@ import com.ananoesis.shell.security.MissingModelApiKeyException;
 import com.ananoesis.shell.service.AgentRunService;
 import com.ananoesis.shell.service.ConversationNotFoundException;
 import com.ananoesis.shell.service.ConversationService;
+import com.ananoesis.shell.support.TurnCancelledException;
 import com.ananoesis.shell.ws.AiStreamFrame;
 import com.ananoesis.shell.ws.ToolCallEventFrame;
 import com.ananoesis.shell.ws.ToolName;
@@ -225,6 +226,19 @@ public class AiAgentService {
     private final ConcurrentHashMap<UUID, Thread> inFlight = new ConcurrentHashMap<>();
 
     /**
+     * 权威停止标志：{@code stop()} 命中在飞回合时置位，回合结束（submit 的 finally）清除。
+     *
+     * <p>WHY 除 interrupt 外还要显式标志（BUG-B）：中断依赖每一层等待点都把
+     * {@code InterruptedException} 透传上去，而历史上的工具回退/审批回落会把它吞成
+     * 普通失败；只要有一层吞了，用户就停不下来。集合成员判断不依赖线程标志，
+     * 在回合推进的每个检查点（轮首/工具间/流式增量）都能可靠终止。</p>
+     */
+    private final Set<UUID> stopRequested = ConcurrentHashMap.newKeySet();
+
+    /** 在飞回合→终端会话 id：{@code stop()} 据此找到调度器打断远端在飞命令（BUG-B）。 */
+    private final ConcurrentHashMap<UUID, UUID> inFlightSession = new ConcurrentHashMap<>();
+
+    /**
      * 容器使用的构造器。
      *
      * <p>WHY 必须显式标 {@code @Autowired}：本类有多个构造器。Spring 面对多于一个候选构造器、
@@ -322,6 +336,8 @@ public class AiAgentService {
                     emit(AiStreamFrame.error(request.conversationId(), ErrorCode.INTERNAL_ERROR, ERR_INTERNAL));
                 } finally {
                     inFlight.remove(request.conversationId());
+                    // 停止标志与回合同生命周期：回合已结束，残留会让下一回合开局即被停
+                    stopRequested.remove(request.conversationId());
                 }
             });
         } catch (RejectedExecutionException e) {
@@ -349,6 +365,14 @@ public class AiAgentService {
             return false;
         }
         LOG.info("正在停止会话回合: conversationId={}", conversationId);
+        // 权威标志先行：即使 interrupt 被某层吞掉，回合推进的检查点也能终止它（BUG-B）
+        stopRequested.add(conversationId);
+        // 仅中断本地线程不够：远端 PTY 上的命令（如安装中的 JDK）还在跑，
+        // 必须由调度器对在飞命令发 Ctrl-C（BUG-B）
+        UUID sessionId = inFlightSession.get(conversationId);
+        if (sessionId != null) {
+            agentTools.interruptInFlightCommand(sessionId.toString());
+        }
         worker.interrupt();
         return true;
     }
@@ -364,6 +388,11 @@ public class AiAgentService {
         UUID conversationId = request.conversationId();
         boolean thinking = false;
         UUID hostId = request.hostId();
+        // 登记回合→会话映射，供 stop() 定位调度器打断远端命令（BUG-B）；
+        // 放在 runTurn 而非 submit：包级 runTurn 也是测试/恢复路径的入口
+        if (request.sessionId() != null) {
+            inFlightSession.put(conversationId, request.sessionId());
+        }
         try {
             AiConversation conversation = conversations.requireRow(conversationId);
             if (hostId == null) {
@@ -426,17 +455,23 @@ public class AiAgentService {
             emitError(conversationId, code, code == ErrorCode.MODEL_ENDPOINT_UNREACHABLE
                     ? ERR_UNREACHABLE : code == ErrorCode.MODEL_ENDPOINT_ERROR ? ERR_ENDPOINT : ERR_INTERNAL,
                     hostId, thinking);
+        } finally {
+            inFlightSession.remove(conversationId);
         }
     }
 
     /**
      * 沿 cause 链识别 InterruptedException（与 {@link #classify} 同风格的自引用/深度守卫）：
      * 阻塞式流读被 interrupt() 打断时，异常往往被框架包一至两层才到本层 catch。
+     *
+     * <p>{@link TurnCancelledException} 本身即「用户停止」标记，直接命中：
+     * 权威停止标志检查点抛出的实例没有 InterruptedException 源（cause 为 null），
+     * 沿链识别不到，必须按类型放行（BUG-B）。</p>
      */
     static boolean causedByInterrupt(Throwable error) {
         Throwable cursor = error;
         for (int depth = 0; cursor != null && depth < 16; depth++) {
-            if (cursor instanceof InterruptedException) {
+            if (cursor instanceof InterruptedException || cursor instanceof TurnCancelledException) {
                 return true;
             }
             cursor = cursor.getCause() == cursor ? null : cursor.getCause();
@@ -452,7 +487,7 @@ public class AiAgentService {
                             @Nullable UUID hostId, @Nullable String hostLabel, boolean toolsAvailable,
                             boolean thinking, Map<String, Object> toolContext) throws InterruptedException {
         for (int round = 1; round <= MAX_TOOL_ROUNDS; round++) {
-            if (Thread.currentThread().isInterrupted()) {
+            if (stopRequested.contains(conversationId) || Thread.currentThread().isInterrupted()) {
                 throw new InterruptedException("回合被用户停止");
             }
 
@@ -493,6 +528,11 @@ public class AiAgentService {
 
             List<ToolOutcome> outcomes = new ArrayList<>(result.calls.size());
             for (MutableToolCall call : result.calls.values()) {
+                // 工具间检查点：某个工具内部把停止吞成普通失败时，也不得继续
+                // 执行后续工具/回喂模型——这就是用户看到的「停不下来」（BUG-B）
+                if (stopRequested.contains(conversationId)) {
+                    throw new InterruptedException("回合被用户停止");
+                }
                 outcomes.add(routeAndReport(call, conversationId, hostId, hostLabel,
                         toolsAvailable, toolContext));
             }
@@ -596,6 +636,10 @@ public class AiAgentService {
                                     UUID conversationId, boolean thinking) {
         RoundResult result = new RoundResult();
         for (ChatResponse chunk : model.stream(new Prompt(prompt)).toIterable()) {
+            if (stopRequested.contains(conversationId)) {
+                // 流式读期间停止：立即中断消费，不把半截回答继续推给前端（BUG-B）
+                throw new TurnCancelledException("流式输出期间被用户停止", null);
+            }
             if (chunk == null) {
                 continue;
             }
@@ -722,6 +766,12 @@ public class AiAgentService {
             return new ToolOutcome(ToolResultStatus.SUCCESS, params, null,
                     result == null ? "" : result, false);
         } catch (RuntimeException e) {
+            if (causedByInterrupt(e)) {
+                // BUG-B：工具 callback 层会把 TurnCancelledException 包成框架异常；
+                // 识别后 MUST 继续上抛而不是伪装成 tool_result(ERROR) 回喂模型——
+                // 模型收到「执行失败」就会接着分析另想办法，表现为停不下来
+                throw new TurnCancelledException("只读工具执行中被用户停止", e);
+            }
             LOG.warn("只读工具执行失败: tool={} cause={}", toolName.getValue(), e.getClass().getSimpleName());
             LOG.debug("只读工具失败详情", e);
             return new ToolOutcome(ToolResultStatus.ERROR, params, null,

@@ -1,18 +1,13 @@
 package com.ananoesis.shell.ssh;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-
+import static org.assertj.core.api.Assertions.assertThat;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -51,6 +46,11 @@ class PtyCommandSchedulerTest {
     /** 创建自定义超时配置的调度器。 */
     private PtyCommandScheduler createScheduler(long timeoutMs, long watchMs) {
         return new PtyCommandScheduler(terminal, NONCE, executor, timeoutMs, watchMs);
+    }
+
+    /** 创建自定义三项超时配置的调度器（绝对上限可测）。 */
+    private PtyCommandScheduler createScheduler(long timeoutMs, long watchMs, long maxAbsoluteMs) {
+        return new PtyCommandScheduler(terminal, NONCE, executor, timeoutMs, watchMs, maxAbsoluteMs);
     }
 
     // ==================================================================
@@ -346,6 +346,109 @@ class PtyCommandSchedulerTest {
             PtyCommandScheduler.CommandResult result = future.get(2, TimeUnit.SECONDS);
             assertThat(result.timedOut()).isFalse();
             assertThat(result.stdout()).isEqualTo("ok\n");
+        }
+
+        @Test
+        @DisplayName("持续输出的命令不被空闲超时打断；停止活动后才发 Ctrl-C（BUG-A）")
+        void activeOutputExtendsTimeout() throws Exception {
+            // 安装 JDK 这类分钟级命令持续刷进度条，旧实现的 60s 绝对超时
+            // 直接发 Ctrl-C 杀掉正在正常工作的安装进程——必须改为空闲超时
+            // WHY 超时 500ms / 活动间隔 100ms = 5:1 裕量：旧 2:1 比值在 Windows
+            // 线程调度抖动下会误触发（scheduler 线程在两次 collectOutput 间隙判定空闲 >200ms）
+            PtyCommandScheduler scheduler = createScheduler(500, 150);
+            scheduler.onIntegrationSuccess();
+
+            CompletableFuture<PtyCommandScheduler.CommandResult> future =
+                    scheduler.submitCommand("yum install -y java-1.8.0-openjdk");
+
+            // 模拟 600ms 持续输出（活动间隔 100ms，裕量为空闲阈值 500ms 的 1/5）
+            long deadline = System.currentTimeMillis() + 600;
+            while (System.currentTimeMillis() < deadline) {
+                scheduler.collectOutput("Downloading...\n");
+                Thread.sleep(100);
+            }
+            // 活动期内不得中断：Ctrl-C 未发、命令仍在飞
+            assertThat(terminal.sentData).as("持续输出的命令不应被空闲超时打断").doesNotContain("\u0003");
+            assertThat(future.isDone()).as("命令应仍在执行").isFalse();
+
+            // 停止一切输出后，空闲达到 500ms 阈值才发 Ctrl-C（等 1200ms 留足裕量）
+            Thread.sleep(1200);
+            assertThat(terminal.sentData).as("停止活动后空闲超时应中断").contains("\u0003");
+        }
+
+        @Test
+        @DisplayName("持续活动但超过绝对上限仍被中断（防跑飞兜底）")
+        void absoluteCapInterruptsEvenIfActive() throws Exception {
+            // 空闲超时会让真正卡死的命令无限占用输入权，故叠加绝对上限：
+            // timeout=200/maxAbs=400，每 50ms 输出一次（idle 永不超时），
+            // 但 elapsed 过 400ms 必须被中断
+            PtyCommandScheduler scheduler = createScheduler(200, 150, 400);
+            scheduler.onIntegrationSuccess();
+
+            scheduler.submitCommand("yes | tee /dev/null");
+
+            long deadline = System.currentTimeMillis() + 800;
+            while (System.currentTimeMillis() < deadline) {
+                scheduler.collectOutput("y\n");
+                Thread.sleep(50);
+            }
+            assertThat(terminal.sentData).as("超过绝对上限应中断，即使仍在输出").contains("\u0003");
+        }
+
+        @Test
+        @DisplayName("PTY 等待上限覆盖绝对上限（runner/tools 不得提前弃等回落 exec）")
+        void ptyWaitCeilingCoversAbsoluteCap() {
+            // BUG-A/B 交叉点：调度器自己会在绝对上限处中断并完成 future，
+            // 等待方（ApprovedCommandRunner/AgentTools）的 get 上限必须更晚，
+            // 否则会超时回落 exec 把同一命令重跑一遍
+            assertThat(PtyCommandScheduler.ptyWaitCeilingSeconds(60))
+                    .isGreaterThanOrEqualTo(PtyCommandScheduler.DEFAULT_MAX_ABSOLUTE_MS / 1000);
+            // settings 时限大于上限时仍以 settings 为准（用户显式配置优先）
+            assertThat(PtyCommandScheduler.ptyWaitCeilingSeconds(7200))
+                    .isGreaterThanOrEqualTo(7200);
+        }
+    }
+
+    // ==================================================================
+    // 在飞命令主动中断（BUG-B 配套：用户打断回合时同步 Ctrl-C 远端命令）
+    // ==================================================================
+
+    @Nested
+    @DisplayName("interruptCurrent 主动中断")
+    class InterruptCurrent {
+
+        @Test
+        @DisplayName("发 Ctrl-C 并进观察窗口；PROMPT 证据后回 manual_idle 且带超时标记")
+        void interruptThenPromptEvidenceRecoversToManualIdle() throws Exception {
+            PtyCommandScheduler scheduler = createScheduler(10_000, 300);
+            scheduler.onIntegrationSuccess();
+
+            CompletableFuture<PtyCommandScheduler.CommandResult> future =
+                    scheduler.submitCommand("sleep 999");
+
+            scheduler.interruptCurrent();
+
+            assertThat(terminal.sentData).as("应主动向远端发 Ctrl-C").contains("\u0003");
+            assertThat(future.isDone()).as("观察窗口内等待完成证据，不立即完成").isFalse();
+
+            // 远端回到提示符（无 CMD_END，属中断后路径）→ 完成且回 manual_idle
+            scheduler.onFrame(new ShellFrame(ShellFrameType.PROMPT, NONCE, "c1", ""));
+
+            PtyCommandScheduler.CommandResult result = future.get(1, TimeUnit.SECONDS);
+            assertThat(result.timedOut()).as("主动中断的回合应带超时/中断标记").isTrue();
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
+        }
+
+        @Test
+        @DisplayName("无在飞命令时 interruptCurrent 无副作用")
+        void interruptCurrentNoopWithoutInFlight() {
+            PtyCommandScheduler scheduler = createScheduler();
+            scheduler.onIntegrationSuccess();
+
+            scheduler.interruptCurrent();
+
+            assertThat(terminal.sentData).doesNotContain("\u0003");
+            assertThat(scheduler.state()).isEqualTo(PtyCommandScheduler.State.MANUAL_IDLE);
         }
     }
 

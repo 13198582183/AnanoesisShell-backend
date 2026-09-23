@@ -23,7 +23,8 @@ import org.slf4j.LoggerFactory;
  *   <li>人工半行/粘贴/全屏/嵌套 Shell 时不注入 Agent 字节</li>
  *   <li>只有确认空提示符（{@code manual_idle}）才领取输入权</li>
  *   <li>串行执行：读到可靠完成帧（{@code CMD_END} + {@code PROMPT}）才允许下一个</li>
- *   <li>60 秒超时 + 64 KiB 采集上限（design.md D3 默认配置）</li>
+ *   <li>空闲超时（默认 60 秒无输出/无帧活动）+ 30 分钟绝对上限兜底 +
+ *       64 KiB 采集上限（BUG-A 改造：分钟级安装命令持续输出时不得被误杀）</li>
  *   <li>超限继续排空、仅丢弃超额采集内容</li>
  *   <li>中断后 3 秒无完成证据 → {@code unknown}</li>
  * </ul>
@@ -35,14 +36,38 @@ public class PtyCommandScheduler {
 
     private static final Logger LOG = LoggerFactory.getLogger(PtyCommandScheduler.class);
 
-    /** design.md D3：60 秒执行超时。 */
+    /** design.md D3：60 秒无活动（空闲）超时。命令持续有输出即视为存活，
+     *  超过此间隔无任何输出/帧才中断（BUG-A：旧语义为绝对超时，
+     *  安装 JDK 等分钟级命令被误杀）。 */
     static final long DEFAULT_TIMEOUT_MS = 60_000;
 
     /** design.md D3：中断后 3 秒无完成证据 → unknown。 */
     static final long DEFAULT_INTERRUPT_WATCH_MS = 3_000;
 
+    /**
+     * 单条命令绝对执行上限（兜底）：无论是否持续输出，超过此时长必被中断。
+     *
+     * <p>WHY 需要绝对上限：空闲超时依赖输出活动判存活，真正“跑飞”的命令
+     * （死循环刷输出、无限下载）会无限占用输入权，必须有硬兜底。</p>
+     */
+    static final long DEFAULT_MAX_ABSOLUTE_MS = 30 * 60_000L;
+
+    /** 等待方（runner/tools）future.get 相对绝对上限的余量（秒），避免提前弃等回落 exec。 */
+    private static final long PTY_WAIT_GRACE_SECONDS = 10;
+
     /** design.md D3：64 KiB 单命令采集上限。 */
     static final int MAX_COLLECTION_BYTES = 65536;
+
+    /**
+     * PTY 路径等待方的 get 上限（秒）。
+     *
+     * <p>WHY 必须晚于调度器自己的绝对上限：调度器会在上限处主动中断并完成
+     * future；若等待方先超时，会误判“PTY 不可用”回落 exec 把同一命令
+     * 重跑一遍（BUG-B 实测现象）。用户显式配置更大的运行时限时以配置为准。</p>
+     */
+    public static long ptyWaitCeilingSeconds(long settingsTimeoutSeconds) {
+        return Math.max(settingsTimeoutSeconds, DEFAULT_MAX_ABSOLUTE_MS / 1000 + PTY_WAIT_GRACE_SECONDS);
+    }
 
     /** Ctrl-C 字符（ASCII ETX）。 */
     private static final String CTRL_C = "\u0003";
@@ -84,6 +109,8 @@ public class PtyCommandScheduler {
     private final ScheduledExecutorService scheduler;
     private final long timeoutMs;
     private final long interruptWatchMs;
+    /** 单条命令绝对执行上限（防跑飞兜底，与是否活跃无关）。 */
+    private final long maxAbsoluteMs;
 
     // ==================================================================
     // 运行时状态
@@ -137,11 +164,26 @@ public class PtyCommandScheduler {
                                ScheduledExecutorService scheduler,
                                long timeoutMs,
                                long interruptWatchMs) {
+        this(terminalSession, expectedNonce, scheduler, timeoutMs, interruptWatchMs, DEFAULT_MAX_ABSOLUTE_MS);
+    }
+
+    /**
+     * 构造调度器（含绝对上限的完整配置——供测试与未来配置化使用）。
+     *
+     * @param maxAbsoluteMs 单条命令绝对执行上限（毫秒）
+     */
+    public PtyCommandScheduler(SshTerminalSession terminalSession,
+                               String expectedNonce,
+                               ScheduledExecutorService scheduler,
+                               long timeoutMs,
+                               long interruptWatchMs,
+                               long maxAbsoluteMs) {
         this.terminalSession = Objects.requireNonNull(terminalSession, "terminalSession 不得为 null");
         this.expectedNonce = Objects.requireNonNull(expectedNonce, "expectedNonce 不得为 null");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler 不得为 null");
         this.timeoutMs = timeoutMs;
         this.interruptWatchMs = interruptWatchMs;
+        this.maxAbsoluteMs = maxAbsoluteMs;
     }
 
     // ==================================================================
@@ -304,6 +346,11 @@ public class PtyCommandScheduler {
         }
 
         synchronized (this) {
+            // 任何控制帧都是命令存活的证据（如长命令末尾的 CWD/CMD_END 帧），
+            // 刷新空闲计时起点
+            if (currentCommand != null) {
+                currentCommand.lastActivityNanos = System.nanoTime();
+            }
             switch (frame.type()) {
                 case CMD_START:
                     handleCmdStart(frame);
@@ -343,6 +390,8 @@ public class PtyCommandScheduler {
         }
         synchronized (this) {
             if (currentCommand != null && state == State.AGENT_OWNED) {
+                // 输出活动刷新空闲计时：持续刷进度的安装命令不得被误杀（BUG-A）
+                currentCommand.lastActivityNanos = System.nanoTime();
                 currentCommand.appendOutput(data);
             }
         }
@@ -355,6 +404,9 @@ public class PtyCommandScheduler {
     private CompletableFuture<CommandResult> dispatchCommand(String command) {
         String cmdId = String.valueOf(commandIdCounter.incrementAndGet());
         PendingCommand pending = new PendingCommand(cmdId, command);
+        // 存活计时从派发时刻起算：排队命令的构造时间不能计入空闲/绝对时长
+        pending.dispatchedNanos = System.nanoTime();
+        pending.lastActivityNanos = pending.dispatchedNanos;
         this.currentCommand = pending;
         this.state = State.AGENT_OWNED;
         this.cmdEndReceived = false;
@@ -476,20 +528,67 @@ public class PtyCommandScheduler {
     // 内部：超时与中断
     // ==================================================================
 
+    /**
+     * 超时检查点（watchdog 式）：空闲判定 + 绝对上限判定，活跃则续排。
+     *
+     * <p>WHY 续排而非一次性判定：旧实现在固定 60s 处无条件 Ctrl-C，
+     * 安装类分钟级命令被误杀（BUG-A）。现在只有“连续 timeoutMs 无任何
+     * 输出/帧”或“超过绝对上限”才中断；存活时按“距下次到期的时间”续排，
+     * 检查频率与 timeoutMs 同量级，不引入轮询风暴。</p>
+     */
     private void onTimeout() {
         synchronized (this) {
             if (currentCommand == null || state != State.AGENT_OWNED) {
                 return;
             }
-            LOG.warn("命令执行超时，发送中断: cmdId={}", currentCommand.commandId);
-            // 发送 Ctrl-C 中断命令
-            terminalSession.send(CTRL_C);
-            currentCommand.timedOut = true;
+            long now = System.nanoTime();
+            long idleMs = TimeUnit.NANOSECONDS.toMillis(now - currentCommand.lastActivityNanos);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(now - currentCommand.dispatchedNanos);
 
-            // 启动观察窗口：interruptWatchMs 内等待完成证据
-            pendingWatch = scheduler.schedule(
-                    this::onWatchExpired, interruptWatchMs, TimeUnit.MILLISECONDS);
+            if (idleMs < timeoutMs && elapsedMs < maxAbsoluteMs) {
+                // 命令仍活跃：续排到下一个判定窗口（取两个条件中更早到期者）
+                long delay = Math.min(timeoutMs - idleMs, maxAbsoluteMs - elapsedMs);
+                pendingTimeout = scheduler.schedule(this::onTimeout,
+                        Math.max(delay, 20), TimeUnit.MILLISECONDS);
+                return;
+            }
+
+            if (elapsedMs >= maxAbsoluteMs) {
+                LOG.warn("命令达到绝对执行上限（{}ms），发送中断: cmdId={}", maxAbsoluteMs, currentCommand.commandId);
+            } else {
+                LOG.warn("命令空闲超时（{}ms 无输出），发送中断: cmdId={}", idleMs, currentCommand.commandId);
+            }
+            interruptCurrentLocked();
         }
+    }
+
+    /**
+     * 主动中断当前在飞命令（用户停止 Agent 回合时由 AiAgentService 经网关调用）。
+     *
+     * <p>与超时中断同链路：发 Ctrl-C 后进观察窗口，等到 PROMPT/CMD_END
+     * 完成证据则回 manual_idle；无证据则转 unknown。区别仅在于不带
+     * onStopping 的“永久停止”语义，会话后续仍可继续接受命令。</p>
+     */
+    public void interruptCurrent() {
+        synchronized (this) {
+            if (currentCommand == null || state != State.AGENT_OWNED) {
+                return; // 无在飞命令：无副作用
+            }
+            LOG.info("主动中断在飞命令（用户停止回合）: cmdId={}", currentCommand.commandId);
+            interruptCurrentLocked();
+        }
+    }
+
+    /** 中断当前命令（需在锁内）：Ctrl-C + 观察窗口等待完成证据。 */
+    private void interruptCurrentLocked() {
+        cancelTimeout();
+        // 发送 Ctrl-C 中断命令
+        terminalSession.send(CTRL_C);
+        currentCommand.timedOut = true;
+
+        // 启动观察窗口：interruptWatchMs 内等待完成证据
+        pendingWatch = scheduler.schedule(
+                this::onWatchExpired, interruptWatchMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -594,6 +693,11 @@ public class PtyCommandScheduler {
         final String commandId;
         final String commandText;
         final CompletableFuture<CommandResult> future = new CompletableFuture<>();
+
+        /** 派发时刻（纳秒）：绝对上限的起算点（锁内访问，排队期不计入）。 */
+        long dispatchedNanos;
+        /** 最近一次输出/控制帧时刻（纳秒）：空闲超时的起算点（锁内访问）。 */
+        long lastActivityNanos;
 
         // 累积状态
         final StringBuilder outputBuffer = new StringBuilder();

@@ -11,6 +11,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.sql.DataSource;
 
@@ -682,6 +683,135 @@ class AiAgentServiceTest extends AbstractSqliteIntegrationTest {
         assertThat(fake.execCommands().subList(execBefore, fake.execCommands().size()))
                 .as("只读工具同样不该在 sessionId 存在时回落 exec")
                 .isEmpty();
+    }
+
+    // ==================================================================
+    // BUG-B：工具阶段被用户停止——中断不得被吞、不得回落 exec 重跑、必须打断远端命令
+    // ==================================================================
+
+    @Test
+    @DisplayName("只读工具等待 PTY 结果被中断：MUST NOT 回落 exec 重跑，按停止收尾（BUG-B）")
+    void stopDuringReadOnlyToolDoesNotFallBackToExec() {
+        // 浏览器实测症状：用户 Ctrl+C 停止后 Agent「像没听见一样继续执行命令」——
+        // AgentTools 把 InterruptedException 吞成普通失败并回落 exec 重跑了一遍工具命令
+        PtyCommandGateway gateway = Mockito.mock(PtyCommandGateway.class);
+        Mockito.when(gateway.submit(Mockito.anyString(), Mockito.anyString()))
+                .thenAnswer(invocation -> {
+                    // 模拟 stop() 命中正在 future.get 上阻塞的工作线程
+                    Thread.currentThread().interrupt();
+                    return new CompletableFuture<PtyCommandScheduler.CommandResult>();
+                });
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .toolCall("call_1", "system_info", "{}")
+                .answer("不该走到这")
+                .build();
+        AiAgentService service = newAgent(
+                new StubChatModelProvider(model), AgentTestWiring.directExecutor(), gateway);
+        UUID sessionId = UUID.randomUUID();
+        int execBefore = fake.execCommands().size();
+
+        try {
+            service.runTurn(new TurnRequest(conversationId, hostId, "看下系统信息", sessionId));
+        } finally {
+            // directExecutor 在主线程同步跑回合，兜底清标志防泄漏到后续用例
+            Thread.interrupted();
+        }
+
+        assertThat(fake.execCommands().subList(execBefore, fake.execCommands().size()))
+                .as("停止后回落 exec 重跑命令 = 用户怎么打断都停不下来，MUST 禁止")
+                .isEmpty();
+        // 被吞的真痕迹不在命令重跑（测试替身下 exec 回落在发送前就被标志拦住），
+        // 而在「中断被伪装成工具失败回喂给模型」：模型收到 ERROR 就会继续分析另想办法，
+        // 这正是用户看到的「停不下来、按上一步输出继续执行」
+        assertThat(emitter.ofType(AiStreamFrame.Type.TOOL_RESULT))
+                .as("停止不是工具失败，MUST NOT 把 ERROR 回喂给模型驱动它继续推进")
+                .isEmpty();
+        assertThat(emitter.ofType(AiStreamFrame.Type.ERROR))
+                .as("打断不是失败，不得发错误帧")
+                .isEmpty();
+        assertThat(emitter.only(AiStreamFrame.Type.FINAL).finishReason())
+                .isEqualTo("stopped");
+    }
+
+    @Test
+    @DisplayName("获准命令等待 PTY 结果被中断：MUST NOT 回落 exec 重跑已批准命令（BUG-B）")
+    void stopDuringApprovedCommandDoesNotFallBackToExec() {
+        PtyCommandGateway gateway = Mockito.mock(PtyCommandGateway.class);
+        Mockito.when(gateway.submit(Mockito.anyString(), Mockito.anyString()))
+                .thenAnswer(invocation -> {
+                    Thread.currentThread().interrupt();
+                    return new CompletableFuture<PtyCommandScheduler.CommandResult>();
+                });
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .toolCall("call_1", "run_command",
+                        "{\"command\":\"pwd\",\"ai_analysis\":\"确认目录\"}")
+                .answer("不该走到这")
+                .build();
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        AiAgentService asyncAgent = newAgent(new StubChatModelProvider(model), workers, gateway);
+        UUID sessionId = UUID.randomUUID();
+        try {
+            int execBefore = fake.execCommands().size();
+            assertThat(asyncAgent.submit(new TurnRequest(conversationId, hostId, "我在哪", sessionId)))
+                    .isTrue();
+            until("审批提案已挂起", () -> emitter.latestApprovalId() != null);
+            gate.respond(emitter.latestApprovalId(), ApprovalResponseFrame.Decision.APPROVE);
+            until("回合结束", () -> asyncAgent.inFlightCount() == 0);
+
+            assertThat(fake.execCommands().subList(execBefore, fake.execCommands().size()))
+                    .as("已批准命令被打断后经 exec 重跑一遍：用户停不掉任务的最直接观感（BUG-B）")
+                    .isEmpty();
+            assertThat(emitter.ofType(AiStreamFrame.Type.TOOL_RESULT))
+                    .as("停止不得伪装成工具执行失败回喂模型——它会让模型接着分析错误另想办法")
+                    .isEmpty();
+            assertThat(emitter.only(AiStreamFrame.Type.FINAL).finishReason())
+                    .isEqualTo("stopped");
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    @DisplayName("stop() 必须经调度器 interruptCurrent() 打断在飞远端命令（BUG-B）")
+    void stopInterruptsInFlightRemoteCommand() {
+        // 仅中断本地等待线程不够：远端 PTY 上的命令（如正在跑的 JDK 安装）还在继续，
+        // 必须对调度器发 interruptCurrent() 让 Ctrl-C 到达远端
+        PtyCommandScheduler scheduler = Mockito.mock(PtyCommandScheduler.class);
+        PtyCommandGateway gateway = Mockito.mock(PtyCommandGateway.class);
+        AtomicBoolean submitted = new AtomicBoolean();
+        Mockito.when(gateway.submit(Mockito.anyString(), Mockito.anyString()))
+                .thenAnswer(invocation -> {
+                    submitted.set(true);
+                    // 不完成：回合阻塞在 future.get，直到 stop() 的 interrupt 到达
+                    return new CompletableFuture<PtyCommandScheduler.CommandResult>();
+                });
+        Mockito.when(gateway.findScheduler(Mockito.anyString())).thenReturn(scheduler);
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .toolCall("call_1", "run_command",
+                        "{\"command\":\"yum install -y java-1.8.0-openjdk\",\"ai_analysis\":\"安装 JDK\"}")
+                .answer("不该走到这")
+                .build();
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        AiAgentService asyncAgent = newAgent(new StubChatModelProvider(model), workers, gateway);
+        UUID sessionId = UUID.randomUUID();
+        try {
+            assertThat(asyncAgent.submit(new TurnRequest(conversationId, hostId, "装个 JDK", sessionId)))
+                    .isTrue();
+            until("审批提案已挂起", () -> emitter.latestApprovalId() != null);
+            gate.respond(emitter.latestApprovalId(), ApprovalResponseFrame.Decision.APPROVE);
+            until("命令已进入 PTY 通道", submitted::get);
+
+            assertThat(asyncAgent.stop(conversationId))
+                    .as("回合正在飞，停止必须命中")
+                    .isTrue();
+            until("回合停止收尾", () -> asyncAgent.inFlightCount() == 0);
+
+            Mockito.verify(scheduler).interruptCurrent();
+            assertThat(emitter.only(AiStreamFrame.Type.FINAL).finishReason())
+                    .isEqualTo("stopped");
+        } finally {
+            workers.shutdownNow();
+        }
     }
 
     // ==================================================================

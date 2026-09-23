@@ -18,6 +18,7 @@ import com.ananoesis.shell.ssh.PtyCommandGateway;
 import com.ananoesis.shell.ssh.PtyCommandScheduler;
 import com.ananoesis.shell.ssh.SshConnectException;
 import com.ananoesis.shell.ssh.SshExecService;
+import com.ananoesis.shell.support.TurnCancelledException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -172,6 +173,11 @@ public class ApprovedCommandRunner {
     /**
      * 尝试通过持久 PTY 执行已批准的命令。
      *
+     * <p>WHY 等待上限用 {@link PtyCommandScheduler#ptyWaitCeilingSeconds} 而不是
+     * settings 的超时：调度器已改为「空闲超时 + 绝对上限」语义，长时活跃命令（如
+     * 安装 JDK）会跑满绝对上限；等待方若仍按旧 60s 等待，会在调度器中断之前
+     * 拿不到结果并误回落 exec 通道重跑（BUG-A）。</p>
+     *
      * @return 成功时返回 Result；PTY 不可用时返回 null（调用方回落 exec）
      */
     @Nullable
@@ -181,7 +187,8 @@ public class ApprovedCommandRunner {
             CompletableFuture<PtyCommandScheduler.CommandResult> future =
                     ptyGateway.submit(sessionId, command);
             PtyCommandScheduler.CommandResult cmdResult =
-                    future.get(limits.timeout().toSeconds(), TimeUnit.SECONDS);
+                    future.get(PtyCommandScheduler.ptyWaitCeilingSeconds(limits.timeout().toSeconds()),
+                            TimeUnit.SECONDS);
 
             long elapsedMs = Duration.ofNanos(System.nanoTime() - startNanos).toMillis();
             // PTY 合并 stdout/stderr，全部放在 stdout
@@ -203,7 +210,9 @@ public class ApprovedCommandRunner {
             return null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return null; // 回落
+            // BUG-B：等待被用户停止打断不是「PTY 不可用」，MUST NOT 回落 exec
+            // 把已批准的命令重跑一遍；透传给回合顶层按受控停止收尾
+            throw new TurnCancelledException("等待 PTY 结果时被用户停止", e);
         } catch (ExecutionException e) {
             LOG.warn("PTY 路径执行失败: approvalId={} cause={}",
                     approvalId, String.valueOf(e.getCause().getMessage()));

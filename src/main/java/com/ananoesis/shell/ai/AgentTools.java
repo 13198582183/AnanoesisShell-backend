@@ -18,6 +18,7 @@ import com.ananoesis.shell.ssh.PtyCommandGateway;
 import com.ananoesis.shell.ssh.PtyCommandScheduler;
 import com.ananoesis.shell.ssh.SshConnectException;
 import com.ananoesis.shell.ssh.SshExecService;
+import com.ananoesis.shell.support.TurnCancelledException;
 import com.ananoesis.shell.ws.ToolName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -184,6 +185,9 @@ public class AgentTools {
         if (ptyGateway != null && sessionId != null && !sessionId.isBlank()) {
             try {
                 return tryPtyPath(sessionId, command);
+            } catch (TurnCancelledException e) {
+                // BUG-B：用户停止不是「PTY 路径不可用」，MUST 透传禁止回落 exec 重跑
+                throw e;
             } catch (RuntimeException e) {
                 LOG.debug("PTY 路径不可用，回落 exec 通道: tool={} session={} cause={}",
                         toolName.getValue(), sessionId, e.getMessage());
@@ -196,14 +200,19 @@ public class AgentTools {
     private ExecOutcome tryPtyPath(String sessionId, String command) {
         long start = System.currentTimeMillis();
         CompletableFuture<PtyCommandScheduler.CommandResult> future = ptyGateway.submit(sessionId, command);
+        // WHY 等待上限对齐调度器绝对上限：调度器改为空闲超时语义后，长时活跃命令
+        // 会跑满绝对上限才中断；此处若按旧 30s 等待会提前超时并误回落 exec 重跑（BUG-A）。
+        long waitSeconds = PtyCommandScheduler.ptyWaitCeilingSeconds(READ_ONLY_TIMEOUT_SECONDS);
         try {
-            PtyCommandScheduler.CommandResult result = future.get(READ_ONLY_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            PtyCommandScheduler.CommandResult result = future.get(waitSeconds, TimeUnit.SECONDS);
             long elapsed = System.currentTimeMillis() - start;
             return new ExecOutcome(result.exitCode(), result.stdout(), "",
                     result.truncated(), result.timedOut(), elapsed);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("中断", e);
+            // BUG-B：旧实现抛普通 RuntimeException 被 executeOrReturnError 的
+            // catch(RuntimeException) 当「PTY 不可用」吞掉回落 exec，停止永远停不干净
+            throw new TurnCancelledException("等待 PTY 结果时被用户停止", e);
         } catch (ExecutionException e) {
             throw new RuntimeException("PTY 执行失败", e);
         } catch (TimeoutException e) {
@@ -229,6 +238,26 @@ public class AgentTools {
         }
         PtyCommandScheduler scheduler = ptyGateway.findScheduler(sessionId);
         return scheduler == null ? null : scheduler.sessionCwd();
+    }
+
+    /**
+     * 打断指定会话在飞的远端命令（用户停止回合时由 {@link AiAgentService#stop} 调用）。
+     *
+     * <p>WHY 经本类而不是让 AiAgentService 直连网关：与 {@link #sessionCwdOf} 同理，
+     * 本类持有可选的 {@link PtyCommandGateway}，复用现成查找链改动面最小。
+     * 停止只中断本地等待不够——远端 PTY 上的命令（如安装中的 JDK）还在跑，
+     * 必须由调度器发 Ctrl-C 真正打断（BUG-B）。</p>
+     *
+     * @param sessionId 终端会话 id，可为 null（无网关/未命中静默跳过，不打断停止主流程）
+     */
+    public void interruptInFlightCommand(@Nullable String sessionId) {
+        if (ptyGateway == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        PtyCommandScheduler scheduler = ptyGateway.findScheduler(sessionId);
+        if (scheduler != null) {
+            scheduler.interruptCurrent();
+        }
     }
 
     /**
