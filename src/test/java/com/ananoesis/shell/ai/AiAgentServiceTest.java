@@ -624,6 +624,40 @@ class AiAgentServiceTest extends AbstractSqliteIntegrationTest {
         }
     }
 
+    @Test
+    @DisplayName("用户取消审批：回合立即终结，不回喂模型、不发起下一轮（用户实测追加）")
+    void userCancellationEndsTurnWithoutAnotherModelCall() {
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .toolCall("call_1", "run_command",
+                        "{\"command\":\"echo nope\",\"ai_analysis\":\"取消终结验证\"}")
+                // 旧行为会把「用户已拒绝」回喂，模型拿到第二轮剧本继续吐“不该出现”的回答
+                .answer("不该出现")
+                .build();
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        AiAgentService asyncAgent = newAgent(new StubChatModelProvider(model, ThinkingMode.NON_THINKING), workers);
+        try {
+            assertThat(asyncAgent.submit(new TurnRequest(conversationId, hostId, "跑一条命令"))).isTrue();
+            until("审批提案已挂起", () -> emitter.latestApprovalId() != null);
+
+            gate.respond(emitter.latestApprovalId(), ApprovalResponseFrame.Decision.CANCEL);
+            until("回合已结束", () -> asyncAgent.inFlightCount() == 0);
+
+            assertThat(model.streamCallCount())
+                    .as("取消后 MUST NOT 再次调用模型——回喂拒绝事实会诱导模型另想办法继续推进")
+                    .isEqualTo(1);
+            AiStreamFrame finalFrame = emitter.only(AiStreamFrame.Type.FINAL);
+            assertThat(finalFrame.finishReason()).isEqualTo("approval_cancelled");
+            assertThat(emitter.joinedContent(AiStreamFrame.Type.ANSWER_DELTA))
+                    .contains(AiAgentService.CANCEL_END_NOTE)
+                    .doesNotContain("不该出现");
+            assertThat(lastAssistantMessage(conversationId).getContent())
+                    .as("结束注记落库，用户刷新后仍知道回合为何终止")
+                    .contains(AiAgentService.CANCEL_END_NOTE);
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
     // ==================================================================
     // 15.1 Shell → Agent 状态交接：获准命令与只读工具都 MUST 走共享 PTY
     // ==================================================================

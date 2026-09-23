@@ -160,6 +160,10 @@ public class AiAgentService {
             "（已达到单回合工具调用轮次上限 " + MAX_TOOL_ROUNDS + " 轮，本轮停止推进。"
                     + "请把问题拆小一些，或告诉我要继续哪一步。）";
 
+    /** 用户取消审批终结回合时写给用户的说明（落库，口吻同 ROUND_LIMIT_NOTE）。 */
+    static final String CANCEL_END_NOTE =
+            "（已取消本次操作，本轮对话结束。请告诉我下一步。）";
+
     /** 回合被中断时写给用户的说明。 */
     static final String INTERRUPTED_NOTE = "（本轮处理被中断，命令未执行或结果未取回。请重新提问。）";
 
@@ -527,23 +531,36 @@ public class AiAgentService {
                     conversationId, round, result.calls.size());
 
             List<ToolOutcome> outcomes = new ArrayList<>(result.calls.size());
+            boolean userCancelled = false;
             for (MutableToolCall call : result.calls.values()) {
                 // 工具间检查点：某个工具内部把停止吞成普通失败时，也不得继续
                 // 执行后续工具/回喂模型——这就是用户看到的「停不下来」（BUG-B）
                 if (stopRequested.contains(conversationId)) {
                     throw new InterruptedException("回合被用户停止");
                 }
-                outcomes.add(routeAndReport(call, conversationId, hostId, hostLabel,
-                        toolsAvailable, toolContext));
+                ToolOutcome outcome = routeAndReport(call, conversationId, hostId, hostLabel,
+                        toolsAvailable, toolContext);
+                outcomes.add(outcome);
+                if (outcome.userRejected()) {
+                    // BUG-G：用户在审批弹窗点了「取消」——本轮终结信号，
+                    // MUST NOT 再执行后续工具，也 MUST NOT 回喂模型发起下一轮
+                    userCancelled = true;
+                    break;
+                }
             }
 
+            // outcomes 可能因取消提前 break 而短于 calls：只落已处置的部分，
+            // 未执行的提案被截断丢弃（本轮不会执行它们了）
             conversations.saveAssistantMessage(conversationId, result.text.toString(),
                     result.reasoning.toString(), proposals(result.calls, outcomes));
 
-            List<AssistantMessage.ToolCall> springToolCalls = new ArrayList<>(result.calls.size());
-            List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(result.calls.size());
+            List<AssistantMessage.ToolCall> springToolCalls = new ArrayList<>(outcomes.size());
+            List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>(outcomes.size());
             int index = 0;
             for (MutableToolCall call : result.calls.values()) {
+                if (index >= outcomes.size()) {
+                    break;
+                }
                 ToolOutcome outcome = outcomes.get(index++);
                 conversations.saveToolMessage(conversationId, call.id, call.name,
                         outcome.params(), outcome.status(), outcome.text(), outcome.approvalId(),
@@ -552,6 +569,13 @@ public class AiAgentService {
                 springToolCalls.add(new AssistantMessage.ToolCall(callId, "function", call.name,
                         call.arguments.toString()));
                 responses.add(new ToolResponseMessage.ToolResponse(callId, call.name, outcome.text()));
+            }
+
+            if (userCancelled) {
+                // 拒绝事实不回喂：模型收不到 tool_result，也就没有「下一轮」可推理
+                finishWithNote(conversationId, CANCEL_END_NOTE, "approval_cancelled",
+                        hostId, thinking);
+                return;
             }
 
             prompt.add(AssistantMessage.builder()
@@ -801,7 +825,8 @@ public class AiAgentService {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOG.info("等待审批时被中断: approvalId={}", ticket.approvalId());
-            return rejected(params, ticket.approvalId(), INTERRUPTED_NOTE);
+            // 中断属于停止流程而非用户主动取消裁决，不触发终结回合
+            return rejected(params, ticket.approvalId(), INTERRUPTED_NOTE, false);
         }
 
         if (!outcome.approved()) {
@@ -809,7 +834,10 @@ public class AiAgentService {
                     ? ApprovalAuditService.TIMED_OUT_NOTE
                     : ApprovalAuditService.REJECTED_NOTE;
             LOG.info("命令未获批准: approvalId={} outcome={}", ticket.approvalId(), outcome);
-            return rejected(params, ticket.approvalId(), note);
+            // 只有用户点「取消」（CANCELLED）才是终结回合的信号；
+            // 超时（TIMED_OUT）维持回喂现状，让模型知道等不到裁决
+            return rejected(params, ticket.approvalId(), note,
+                    outcome == ApprovalOutcome.CANCELLED);
         }
 
         // WHY 回读生效命令：用户在弹窗上修改命令后再批准（design D5），落到远端的
@@ -824,8 +852,9 @@ public class AiAgentService {
         return new ToolOutcome(executed.status(), params, ticket.approvalId(), executed.feedback(), false);
     }
 
-    private static ToolOutcome rejected(Map<String, Object> params, UUID approvalId, String note) {
-        return new ToolOutcome(ToolResultStatus.REJECTED, params, approvalId, note, true);
+    private static ToolOutcome rejected(Map<String, Object> params, UUID approvalId, String note,
+                                        boolean userRejected) {
+        return new ToolOutcome(ToolResultStatus.REJECTED, params, approvalId, note, userRejected);
     }
 
     // ==================================================================
@@ -912,9 +941,13 @@ public class AiAgentService {
 
     private List<Map<String, Object>> proposals(Map<String, MutableToolCall> calls,
                                                 List<ToolOutcome> outcomes) {
-        List<Map<String, Object>> proposals = new ArrayList<>(calls.size());
+        List<Map<String, Object>> proposals = new ArrayList<>(outcomes.size());
         int index = 0;
         for (MutableToolCall call : calls.values()) {
+            if (index >= outcomes.size()) {
+                // 取消提前 break：未处置的提案不配对、不落库
+                break;
+            }
             ToolOutcome outcome = outcomes.get(index++);
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", call.id);
@@ -1059,9 +1092,9 @@ public class AiAgentService {
         NOT_APPLICABLE
     }
 
-    /** 一次工具调用的处置结果。 */
+    /** 一次工具调用的处置结果。userRejected = 用户在弹窗点了取消（回合终结信号，BUG-G）。 */
     private record ToolOutcome(ToolResultStatus status, Map<String, Object> params,
-                               @Nullable UUID approvalId, String text, boolean rejected) {
+                               @Nullable UUID approvalId, String text, boolean userRejected) {
     }
 
     /** 一次流式响应的累积结果。 */
