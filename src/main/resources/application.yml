@@ -1,0 +1,198 @@
+# ============================================================================
+# AnanoesisShell 后端配置
+# 依据 openspec 变更 add-ssh-ai-agent-mvp（design.md D2/D5/D6/D7）
+#
+# 安全底线（credential-store spec）：
+#   本文件 MUST NOT 出现任何真实 api key、SSH 密码或私钥；
+#   模型 api key 只能由用户在设置界面填写，经主密钥加密后存入 credentials 表。
+# ============================================================================
+
+server:
+  # WHY 18080 而非默认 8080：开发机上 8080 已被其它项目长期占用（指挥官裁定）。
+  # 集成测试一律使用 RANDOM_PORT（见 AbstractSqliteIntegrationTest），不依赖此值。
+  port: 18080
+  # 阶段 2 套桌面壳时，壳进程会向后端发 SIGTERM；graceful 确保在途 WebSocket/审批被妥善收尾
+  shutdown: graceful
+
+spring:
+  application:
+    name: ananoesis-shell-backend
+
+  # ---------- 数据层：嵌入式 SQLite(WAL)（design.md D6）----------
+  # jdbc-url 与 driver 由 SqliteDataSourceConfiguration 依据 ananoesis.storage.* 构造，
+  # 此处只保留连接池运维参数。
+  datasource:
+    hikari:
+      pool-name: ananoesis-sqlite-pool
+      # WHY 只用 4 条连接：单机单用户场景下并发来自 REST + WebSocket 终端 + AI 落库；
+      #   SQLite 是单写者模型，池过大只会放大 SQLITE_BUSY 争用，收益为零。
+      maximum-pool-size: 4
+      minimum-idle: 1
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # 首个版本化迁移，不存在需要 baseline 的历史库；置 false 可让"库已存在但无历史表"显式失败而非静默跳过
+    baseline-on-migrate: false
+
+  # ---------- Spring AI（design.md D2 / D5）----------
+  # WHY 全部置 none：D5 决定运行时用设置项里的 base_url/api_key/model **手动构造** ChatModel，
+  #   不依赖 auto-config 的单例 bean；同时 credential-store spec 禁止内置任何 api key，
+  #   若放行 auto-config，启动期就会因缺少 api key 而失败。
+  # starter 依赖仍然保留，为 Wave 2 提供 OpenAiApi / OpenAiChatModel 等类路径。
+  ai:
+    model:
+      chat: none
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        speech: none
+        transcription: none
+
+# ---------- MyBatis-Plus（design.md D6）----------
+mybatis-plus:
+  configuration:
+    # 显式声明下划线转驼峰：这是实体 authType ↔ 列 auth_type 映射成立的前提。
+    # MyBatis-Plus 默认即为 true，写出来是为了让"列名与字段名不同形"这件事在配置里可查，
+    # 而不是靠读者记住框架默认值。
+    map-underscore-to-camel-case: true
+  global-config:
+    # 关闭启动 banner：桌面应用的后端进程日志应尽量只含运维信息
+    banner: false
+    db-config:
+      # 全局主键兜底为 TEXT UUID（见 V1 迁移「全局约定」）。
+      # 各实体的 @TableId 已显式声明策略，注解优先于此全局值；
+      # 此处保证"新增实体忘写注解"时行为仍然一致，而不是退回雪花 ID 数字。
+      id-type: assign_uuid
+      # WHY NOT_NULL 策略：DDL 中大量列带默认值（port/status/decision/tool_rejected 等）。
+      #   把 null 字段排除出 INSERT/UPDATE 语句，才能让 DDL 默认值真正生效，
+      #   并避免局部更新时把未参与本次修改的列意外清空。
+      #   注意副作用：需要"把某列显式写成 NULL"的场景（如清空主机的分组）必须绕过
+      #   updateById，改用显式列出各列的 UpdateWrapper —— 见 HostMapper#updateConfiguration。
+      insert-strategy: not_null
+      update-strategy: not_null
+
+# ---------- 本地存储（design.md D6：数据置于用户数据目录，WAL 模式）----------
+ananoesis:
+  storage:
+    # 用户数据目录。测试通过覆盖 ananoesis.storage.data-dir 把库文件重定向到临时目录，
+    # 绝不污染开发者真实数据。
+    data-dir: ${user.home}/.ananoesis
+    database-file-name: data.db
+    # 追加到 JDBC URL 的 PRAGMA 参数。
+    # WHY journal_mode=WAL：design.md D6 明确要求，缓解单机下读写并发。
+    # WHY foreign_keys=on：SQLite 默认关闭外键，且该属性是连接级的，必须每条连接都设。
+    # WHY busy_timeout=10000：写冲突时让驱动自旋等待而不是立刻抛 SQLITE_BUSY。
+    # WHY synchronous=NORMAL：WAL 下官方推荐的桌面折中，断电最多丢最后一个事务但不会损坏库。
+    jdbc-parameters: "journal_mode=WAL&foreign_keys=on&busy_timeout=10000&synchronous=NORMAL"
+
+  # ---------- SSH 双通道（design.md D4：交互式 PTY + 独立 exec）----------
+  # WHY 需要显式超时与输出上限：sshj 的 socket 超时默认为 0（永不超时）。
+  #   若不设置，spec 明确要求的「主机不可达」场景会表现为界面永久转圈——
+  #   用户既看不到错误也无法取消。同理，exec 通道若没有输出上限，
+  #   一条 cat 大文件 就能同时撑爆 AI 的上下文与 JVM 堆。
+  #
+  # 已知漂移风险（须在设置模块落地时消除）：connect-timeout / exec-timeout /
+  #   exec-max-output-bytes 三项与 V1 迁移预置的 settings 行语义重叠
+  #   （ssh.connect.timeout.seconds=15、run_command.timeout.seconds=60、
+  #   run_command.max_output_bytes=65536）。settings 表的 REST 管理属后续 Wave；
+  #   届时本段应改为"启动取默认、运行期以 DB 值为准"，否则用户在设置界面改了超时却不生效。
+  #   当前两份值由 SshPropertiesDefaultsTest 钉住一致。
+  ssh:
+    # TCP 连接 + 版本串交换 + 密钥协商 + 认证的总时限。
+    # WHY 它同时约束握手：sshj 在 SocketClient.onConnect() 里把该值落到 socket 的
+    #   SO_TIMEOUT 上，而版本串交换（TransportImpl.receiveServerIdent）是在 connect()
+    #   内部逐字节直读 socket 的——所以"对端接受 TCP 却不说话"的黑洞主机也会在这里
+    #   超时，而不是永久挂起。建连后的读循环（sshj Reader）对该超时是有容忍的，
+    #   通道数据流用的是无超时等待，因此空闲的交互式终端不会被它误杀。
+    connect-timeout: 15s
+    # exec 通道单条命令的执行时限：防止 tail -f 这类永不退出的命令挂死 AI 的工具调用
+    exec-timeout: 60s
+    # exec 通道 stdout/stderr 各自的采集上限（字节）；超限截断并在结果里标记 truncated
+    exec-max-output-bytes: 65536
+    # 交互式终端的空闲回收时限。用户直接关掉标签页时前端来不及发 action=close，
+    #   只有服务端扫描能兜底释放 socket、两条读线程与远端 shell。
+    terminal-idle-timeout: 30m
+    # 空闲扫描周期（TerminalIdleReaper 的 initialDelay 与 fixedDelay 同取此值）
+    terminal-idle-check-interval: 1m
+    # PTY 参数。WHY 显式给列数行数而不用 allocateDefaultPTY()：默认值取自 JVM 环境，
+    #   服务进程里没有终端，会得到一个 0x0 的 PTY，远端程序按 0 列换行，前端首屏即是乱码。
+    #   前端 xterm.js 的初始尺寸应与此处一致。
+    pty-term: xterm-256color
+    pty-columns: 80
+    pty-rows: 24
+    # SSH keep-alive 间隔。WHY 需要：NAT/防火墙会静默丢弃长时间无流量的连接，
+    #   用户回来敲键盘时才发现"终端死了"却没有任何提示。
+    #   注意 MUST 在建连前设置——sshj 只在 onConnect() 里、且 isEnabled() 为真时才启动心跳线程。
+    keep-alive-interval: 30s
+
+  # ---------- WebSocket 通道（design.md D7；asyncapi.yaml servers.ws）----------
+  # 允许跨源握手的源列表，逗号分隔。**默认为空 = 只接受同源或无 Origin 头的握手**。
+  # WHY 默认严格：/ws/terminal 能驱动用户配置好的 SSH 会话在远端执行任意命令。
+  #   放开成 * 之后，浏览器里任何恶意页面都能连上本机端点并敲命令（CSWSH）；
+  #   WebSocket 握手不走 REST 那套凭据/CSRF 防护，Origin 校验是唯一的闸门。
+  # 前端在 Vite dev server（http://localhost:3000/3001）上联调时，临时改为：
+  #   allowed-origins: http://localhost:3000,http://localhost:3001
+  # 详见 WebSocketConfiguration 的类注释。
+  ws:
+    allowed-origins: "http://localhost:3000,http://localhost:3001"
+
+# ---------- Actuator：/actuator/health 是 tasks 2.4 的启动验收门禁 ----------
+management:
+  endpoints:
+    web:
+      exposure:
+        # 只暴露健康检查；MVP 无需 beans/env/heapdump 等可能泄露内部信息的端点
+        include: health
+  endpoint:
+    health:
+      # 单机本地使用，展示组件级细节便于排查 SQLite/Flyway 状态
+      show-details: always
+
+logging:
+  level:
+    root: INFO
+    com.ananoesis.shell: DEBUG
+    com.zaxxer.hikari: INFO
+
+    # =====================================================================
+    # 凭据泄露防线：禁止 HTTP 报文体进日志
+    # =====================================================================
+    # credential-store spec：明文凭据 MUST NOT 写入日志。下面三条不是"降噪"，是安全控制。
+    # 它们的作用是让"排障时把 root 调到 DEBUG"这个再正常不过的动作，
+    # 不会顺手把用户的 SSH 私钥写进日志文件。
+    #
+    # ---- 隐患来源（生成器缺陷，已上报架构师）----
+    # openapi.yaml 给 password / private_key / passphrase 三者都标了 writeOnly: true，
+    # 但 openapi-generator 决定 toString() 里是否打掩码时看的是 **format: password**：
+    # password 与 passphrase 带该 format，被打成 "*"；private_key 没有 format，
+    # 于是生成的 Host#toString() 会把整把私钥原样输出。
+    # Spring 在 DEBUG 下会记录 HTTP 报文体，一旦记到 @RequestBody 反序列化后的 DTO，
+    # 就等于调用了那个不安全的 toString()——一次日志级别调整就是一次私钥落盘。
+    # 契约 0.1.0 已冻结（design.md D7），故只能在后端侧设防。
+    # 建议契约给 private_key 补上 format: password，使其在生成物层面即被掩码；
+    # 届时 GeneratedDtoToStringHazardTest 会失败并提醒我们重新评估这三条配置。
+    #
+    # ---- WHY 三条必须齐全（少一条就会漏，这是实测踩出来的坑）----
+    # 1) org.springframework.web.HttpLogging —— Spring 6.1+ 的 HTTP 报文日志**统一回退类目**。
+    #    HttpLogging.forLog(logger) 的语义是"组件自身 logger 没开 DEBUG 时，改用本类目再打一遍"。
+    #    所以只钉组件 logger 不但无效，反而会让同一段报文换个名字继续输出：
+    #    实测把 org.springframework.web.client 钉到 INFO 后，RestTemplate 的出站请求体
+    #    （含完整 private_key）立刻改由 org.springframework.web.HttpLogging 打了出来。
+    #    这一条是三道防线里唯一不可省的。
+    # 2) org.springframework.web.servlet.mvc.method.annotation —— 服务端
+    #    RequestResponseBodyMethodProcessor / HttpEntityMethodProcessor / RequestMappingHandlerMapping
+    #    自身的 logger。它们记录 @RequestBody、响应体与 handler 映射，且**不走** HttpLogging 回退，
+    #    必须单独钉住（实测钉住后 "Read ... to [class Host {...}]" 完全消失）。
+    # 3) org.springframework.web.client —— RestTemplate / RestClient 自身的 logger。
+    #    Wave 3 调用模型端点时，出站报文里带着 api key 与用户对话内容，同样不得进日志。
+    #
+    # ---- 排障时如何临时放开 ----
+    # 只放开 2) 或 3) 而不放开 1) 是无效的（报文会经回退类目输出）；
+    # 放开 1) 前必须确认链路不会经手含私钥的 DTO。最稳妥的做法是本地临时放开、
+    # 且不要把控制台重定向到文件。任何改动都应让 HostsApiCredentialLoggingTest 保持通过：
+    # 它把 root 调到 DEBUG 跑完整 CRUD 链路，断言日志中不出现私钥特征串、明文密码与 passphrase。
+    org.springframework.web.HttpLogging: INFO
+    org.springframework.web.servlet.mvc.method.annotation: INFO
+    org.springframework.web.client: INFO
