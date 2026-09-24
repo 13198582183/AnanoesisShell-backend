@@ -44,6 +44,8 @@ public final class FakeWebSocketSession implements WebSocketSession {
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final AtomicBoolean failing = new AtomicBoolean(false);
     private final AtomicReference<CloseStatus> closeStatus = new AtomicReference<>();
+    /** 每次 sendMessage 前的模拟耗时（毫秒），用于制造并发发送排队场景。 */
+    private volatile long sendDelayMillis;
 
     public FakeWebSocketSession() {
         this(UUID.randomUUID().toString());
@@ -71,6 +73,11 @@ public final class FakeWebSocketSession implements WebSocketSession {
         failing.set(value);
     }
 
+    /** 模拟慢消费：每次发送前睡眠给定毫秒（让装饰器的发送锁被长时间持有）。 */
+    public void setSendDelayMillis(long millis) {
+        this.sendDelayMillis = millis;
+    }
+
     /** @return 关闭时使用的状态；未关闭为 null */
     public CloseStatus closeStatus() {
         return closeStatus.get();
@@ -82,6 +89,14 @@ public final class FakeWebSocketSession implements WebSocketSession {
 
     @Override
     public void sendMessage(WebSocketMessage<?> message) throws IOException {
+        long delay = sendDelayMillis;
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         if (!open.get()) {
             throw new IOException("WebSocket 会话已关闭");
         }

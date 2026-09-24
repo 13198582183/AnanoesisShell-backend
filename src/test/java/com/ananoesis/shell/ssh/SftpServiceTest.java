@@ -3,13 +3,14 @@ package com.ananoesis.shell.ssh;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.PublicKey;
 import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
 
 import com.ananoesis.shell.contract.model.FileEntry;
 import net.schmizz.sshj.SSHClient;
-import net.schmizz.sshj.userauth.keyprovider.KeyProvider;
+import net.schmizz.sshj.transport.verification.HostKeyVerifier;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -64,7 +65,17 @@ class SftpServiceTest {
 
         // 创建真实 SSHClient 连接到测试 SFTP 服务器
         sshClient = new SSHClient();
-        sshClient.addHostKeyVerifier((hostname, port, key) -> true);
+        sshClient.addHostKeyVerifier(new HostKeyVerifier() {
+            @Override
+            public boolean verify(String hostname, int port, PublicKey key) {
+                return true;
+            }
+
+            @Override
+            public List<String> findExistingAlgorithms(String hostname, int port) {
+                return List.of();
+            }
+        });
         sshClient.connect("localhost", sftpServer.port());
         sshClient.authPassword("testuser", "testpass");
 
@@ -192,11 +203,11 @@ class SftpServiceTest {
         void listsDirectoryContents() {
             var result = sftpService.listDir(runtime, "/testdir", null, 100);
 
-            assertThat(result.items()).isNotEmpty();
-            assertThat(result.items())
+            assertThat(result.getItems()).isNotEmpty();
+            assertThat(result.getItems())
                     .extracting(FileEntry::getName)
                     .containsExactlyInAnyOrder("file1.txt", "file2.txt", "subdir");
-            assertThat(result.items())
+            assertThat(result.getItems())
                     .noneMatch(e -> ".".equals(e.getName()) || "..".equals(e.getName()));
         }
 
@@ -205,14 +216,14 @@ class SftpServiceTest {
         void correctlyIdentifiesFileTypes() {
             var result = sftpService.listDir(runtime, "/testdir", null, 100);
 
-            FileEntry subdir = result.items().stream()
+            FileEntry subdir = result.getItems().stream()
                     .filter(e -> "subdir".equals(e.getName()))
                     .findFirst().orElseThrow();
             assertThat(subdir.getIsDir()).isTrue();
             assertThat(subdir.getIsRegular()).isFalse();
             assertThat(subdir.getIsLink()).isFalse();
 
-            FileEntry file = result.items().stream()
+            FileEntry file = result.getItems().stream()
                     .filter(e -> "file1.txt".equals(e.getName()))
                     .findFirst().orElseThrow();
             assertThat(file.getIsDir()).isFalse();
@@ -231,7 +242,7 @@ class SftpServiceTest {
 
             var result = sftpService.listDir(runtime, "/testdir", null, 100);
 
-            FileEntry link = result.items().stream()
+            FileEntry link = result.getItems().stream()
                     .filter(e -> "link.txt".equals(e.getName()))
                     .findFirst().orElseThrow();
             assertThat(link.getIsLink()).isTrue();
@@ -278,7 +289,7 @@ class SftpServiceTest {
 
             var result = sftpService.listDir(runtime, "/bigdir", null, 3);
 
-            assertThat(result.items()).hasSize(3);
+            assertThat(result.getItems()).hasSize(3);
             assertThat(result.getHasMore()).isTrue();
             assertThat(result.getNextCursor()).isNotNull();
         }
@@ -292,19 +303,19 @@ class SftpServiceTest {
             }
 
             var firstPage = sftpService.listDir(runtime, "/bigdir2", null, 3);
-            assertThat(firstPage.items()).hasSize(3);
+            assertThat(firstPage.getItems()).hasSize(3);
             assertThat(firstPage.getHasMore()).isTrue();
 
             var secondPage = sftpService.listDir(runtime, "/bigdir2",
                     firstPage.getNextCursor(), 3);
-            assertThat(secondPage.items()).hasSize(2);
+            assertThat(secondPage.getItems()).hasSize(2);
             assertThat(secondPage.getHasMore()).isFalse();
             assertThat(secondPage.getNextCursor()).isNull();
 
             // 两页的文件名不重复
             var allNames = new java.util.HashSet<String>();
-            firstPage.items().forEach(e -> allNames.add(e.getName()));
-            secondPage.items().forEach(e -> allNames.add(e.getName()));
+            firstPage.getItems().forEach(e -> allNames.add(e.getName()));
+            secondPage.getItems().forEach(e -> allNames.add(e.getName()));
             assertThat(allNames).hasSize(5);
         }
 
@@ -314,7 +325,7 @@ class SftpServiceTest {
             // limit 201 应被截断为 200（不报错）
             var result = sftpService.listDir(runtime, "/testdir", null, 201);
             // 只要不抛异常，且返回结果即可
-            assertThat(result.items()).isNotEmpty();
+            assertThat(result.getItems()).isNotEmpty();
         }
 
         @Test
@@ -322,19 +333,22 @@ class SftpServiceTest {
         void defaultLimitIs100() {
             // 传 null 作为 limit 应使用默认值 100
             var result = sftpService.listDir(runtime, "/testdir", null, null);
-            assertThat(result.items()).isNotEmpty();
+            assertThat(result.getItems()).isNotEmpty();
         }
 
         @Test
         @DisplayName("每连接最多 2 个目录 handle")
         void maxTwoHandlesPerSession() throws IOException {
-            // 创建 3 个目录
+            // 创建 3 个目录；每个放 2 个文件，保证 limit=1 时有下一页（才会生成游标占 handle）
             Path d1 = sftpServer.createDir("handle_d1");
             Path d2 = sftpServer.createDir("handle_d2");
             Path d3 = sftpServer.createDir("handle_d3");
-            sftpServer.createFile(d1, "f.txt", "x");
-            sftpServer.createFile(d2, "f.txt", "x");
-            sftpServer.createFile(d3, "f.txt", "x");
+            sftpServer.createFile(d1, "f1.txt", "x");
+            sftpServer.createFile(d1, "f2.txt", "x");
+            sftpServer.createFile(d2, "f1.txt", "x");
+            sftpServer.createFile(d2, "f2.txt", "x");
+            sftpServer.createFile(d3, "f1.txt", "x");
+            sftpServer.createFile(d3, "f2.txt", "x");
 
             // 打开第 1 个目录
             var r1 = sftpService.listDir(runtime, "/handle_d1", null, 1);
@@ -361,7 +375,7 @@ class SftpServiceTest {
 
             var result = sftpService.listDir(runtime, "/emptydir", null, 100);
 
-            assertThat(result.items()).isEmpty();
+            assertThat(result.getItems()).isEmpty();
             assertThat(result.getHasMore()).isFalse();
             assertThat(result.getNextCursor()).isNull();
         }
