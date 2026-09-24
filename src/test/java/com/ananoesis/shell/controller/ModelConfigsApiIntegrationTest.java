@@ -17,6 +17,7 @@ import com.ananoesis.shell.contract.model.Error;
 import com.ananoesis.shell.contract.model.ErrorCode;
 import com.ananoesis.shell.contract.model.ModelConfig;
 import com.ananoesis.shell.contract.model.ThinkingMode;
+import com.ananoesis.shell.security.MissingModelApiKeyException;
 import com.ananoesis.shell.service.ModelConfigService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.DisplayName;
@@ -31,6 +32,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * tasks 7.1 的验收（模型配置侧）：{@code /api/model-configs} 的 CRUD、生效切换与 api key 密文化。
@@ -376,18 +378,45 @@ class ModelConfigsApiIntegrationTest extends AbstractSqliteIntegrationTest {
     }
 
     @Test
-    @DisplayName("DELETE /api/model-configs/{生效 id} → 409 conflict（TRACEABILITY Q4）")
-    void deleteActiveModelConfigIsConflict() {
+    @DisplayName("DELETE /api/model-configs/{生效 id} → 204，生效指针一并清除（零配置是合法状态）")
+    void deleteActiveModelConfigClearsActivePointer() {
         ModelConfig active = create("10.95.5.21", API_KEY, null);
         activate(active.getId());
+        String id = active.getId().toString();
 
-        ResponseEntity<String> raw = rest.exchange("/api/model-configs/" + active.getId(), HttpMethod.DELETE,
+        ResponseEntity<String> raw = rest.exchange("/api/model-configs/" + id, HttpMethod.DELETE,
                 HttpEntity.EMPTY, String.class);
 
-        assertThat(raw.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        Error error = parseError(raw.getBody());
-        assertThat(error.getCode()).isEqualTo(ErrorCode.CONFLICT);
-        assertThat(selectConfigJson(active.getId().toString())).as("被拒绝的删除不得留下副作用").isNotNull();
+        // WHY 204 而不是历史的 409：首条配置自动生效，「只剩一条」必然「它就是生效项」，
+        // 409 意味着用户永远删不掉最后一条配置——而零配置本就是空库首启的合法初始态
+        assertThat(raw.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(selectConfigJson(id)).as("配置行应被删除").isNull();
+        assertThat(countCredentialRows(id)).as("密文应连带清理").isZero();
+        assertThat(readActiveConfigId()).as("删除生效配置后不得留下悬空指针").isNull();
+    }
+
+    @Test
+    @DisplayName("删除最后一条配置 → 204，回到零配置初始态；requireActive 给出与空库首启一致的提示")
+    void deleteLastModelConfigReturnsToZeroConfigState() {
+        purgeAllModelConfigs();
+        try {
+            ModelConfig only = create("10.95.5.23", API_KEY, null);
+            assertThat(only.getIsActive()).as("唯一配置必然生效").isTrue();
+
+            ResponseEntity<String> raw = rest.exchange("/api/model-configs/" + only.getId(), HttpMethod.DELETE,
+                    HttpEntity.EMPTY, String.class);
+
+            assertThat(raw.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+            List<ModelConfig> items = parseList(rest.getForEntity("/api/model-configs", String.class).getBody());
+            assertThat(items).as("列表应回到与空库首启相同的零配置态").isEmpty();
+            assertThat(readActiveConfigId()).isNull();
+            assertThatThrownBy(() -> modelConfigService.requireActive())
+                    .as("零配置时取生效配置应报可读引导，而不是 NPE 或静默")
+                    .isInstanceOf(MissingModelApiKeyException.class)
+                    .hasMessageContaining("尚无生效的模型配置");
+        } finally {
+            purgeAllModelConfigs();
+        }
     }
 
     @Test

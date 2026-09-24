@@ -11,6 +11,10 @@ server:
   # WHY 18080 而非默认 8080：开发机上 8080 已被其它项目长期占用（指挥官裁定）。
   # 集成测试一律使用 RANDOM_PORT（见 AbstractSqliteIntegrationTest），不依赖此值。
   port: 18080
+  # WHY 默认只绑回环：本应用定位为单机本地使用（见上方 manage- ment 注释同源），
+  # 绑定 127.0.0.1 让任何非本机网卡 IP 的连接在 TCP 层即被拒——桌面形态"仅回环"
+  # 约束（design D4）的落地基线；开发形态经 vite proxy 转发到 localhost 不受影响。
+  address: 127.0.0.1
   # 阶段 2 套桌面壳时，壳进程会向后端发 SIGTERM；graceful 确保在途 WebSocket/审批被妥善收尾
   shutdown: graceful
 

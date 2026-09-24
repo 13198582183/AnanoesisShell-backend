@@ -90,6 +90,13 @@ class AiAgentServiceTest extends AbstractSqliteIntegrationTest {
 
     private static final String HOST_LABEL = "AI 测试机";
 
+    /**
+     * 内联思考标签的开/闭对：用拼接构造而非字面量（与模型真实输出同语义，
+     * 但避免与本文件工具链对成对尖括号标记的处理冲突）。
+     */
+    static final String THINK_OPEN = "<" + "think" + ">";
+    static final String THINK_CLOSE = "<" + "/" + "think" + ">";
+
     private static FakeSshServer fake;
 
     @Autowired
@@ -263,6 +270,81 @@ class AiAgentServiceTest extends AbstractSqliteIntegrationTest {
         assertThat(assistant.getContent()).isEqualTo("最终回答");
         assertThat(assistant.getThinkingContent()).as("契约 Message.thinking_content 必须承载思考过程")
                 .isEqualTo("推理过程");
+    }
+
+    @Test
+    @DisplayName("内联 think 标签（Qwen3 类自托管模型）：标签内归 thinking、标签外归 answer，标签本身不展示")
+    void inlineThinkTagsAreSplitIntoThinkingSegments() {
+        // 真实形状：MindIE/vLLM 部署的 Qwen3 不走 reasoning_content 字段，
+        // 而是把思考以 think 开闭标签内联在 content 里逐字流出（桌面壳实测截图实证）
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .round(ScriptedChatModel.content(THINK_OPEN + "先看端口再看内存"),
+                        ScriptedChatModel.content(THINK_CLOSE + "结论：重启即可"))
+                .build();
+
+        agent(model).runTurn(new TurnRequest(conversationId, hostId, "服务挂了怎么办"));
+
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.THINKING_DELTA))
+                .as("标签内文本必须作为思考增量到达").isEqualTo("先看端口再看内存");
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.ANSWER_DELTA))
+                .as("标签外是回答，且标签本身不得漏给用户").isEqualTo("结论：重启即可");
+
+        Message assistant = lastAssistantMessage(conversationId);
+        assertThat(assistant.getContent()).isEqualTo("结论：重启即可");
+        assertThat(assistant.getThinkingContent())
+                .as("落库要与 reasoning_content 列同构，历史面板才分得开").isEqualTo("先看端口再看内存");
+    }
+
+    @Test
+    @DisplayName("内联标签被 SSE 分片拦腰截断：半截标签不得泄漏到任何一帧")
+    void inlineThinkTagSplitAcrossChunksDoesNotLeak() {
+        // 分片边界正好落在标签中间，解析器必须缓存待定前缀
+        String openHead = THINK_OPEN.substring(0, THINK_OPEN.length() - 1);
+        String openTail = THINK_OPEN.substring(THINK_OPEN.length() - 1);
+        String closeHead = THINK_CLOSE.substring(0, THINK_CLOSE.length() - 3);
+        String closeTail = THINK_CLOSE.substring(THINK_CLOSE.length() - 3);
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .round(ScriptedChatModel.content("答复A" + openHead),
+                        ScriptedChatModel.content(openTail + "首段"),
+                        ScriptedChatModel.content("中段" + closeHead),
+                        ScriptedChatModel.content(closeTail + "答复B"))
+                .build();
+
+        agent(model).runTurn(new TurnRequest(conversationId, hostId, "问一句"));
+
+        String answer = emitter.joinedContent(AiStreamFrame.Type.ANSWER_DELTA);
+        assertThat(answer).as("标签碎片既不是回答也不该显示").doesNotContain(openHead)
+                .doesNotContain(closeHead).isEqualTo("答复A答复B");
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.THINKING_DELTA)).isEqualTo("首段中段");
+    }
+
+    @Test
+    @DisplayName("内联标签未闭合（回合结束时仍在思考中）：余文归思考，不凭空丢字")
+    void unclosedInlineThinkTagKeepsRemainderAsThinking() {
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .round(ScriptedChatModel.content("回答前半"),
+                        ScriptedChatModel.content(THINK_OPEN + "还没想完"))
+                .build();
+
+        agent(model).runTurn(new TurnRequest(conversationId, hostId, "问一句"));
+
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.ANSWER_DELTA)).isEqualTo("回答前半");
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.THINKING_DELTA)).isEqualTo("还没想完");
+    }
+
+    @Test
+    @DisplayName("非思考模式：内联 think 标签原样透传，不解析（与 reasoningContent 回显同口径）")
+    void nonThinkingModePassesInlineTagsThrough() {
+        ScriptedChatModel model = ScriptedChatModel.builder()
+                .round(ScriptedChatModel.content("正文" + THINK_OPEN + "标签原文")).build();
+
+        agentFor(new StubChatModelProvider(model, ThinkingMode.NON_THINKING))
+                .runTurn(new TurnRequest(conversationId, hostId, "问一句"));
+
+        assertThat(emitter.ofType(AiStreamFrame.Type.THINKING_DELTA)).isEmpty();
+        assertThat(emitter.joinedContent(AiStreamFrame.Type.ANSWER_DELTA))
+                .as("非思考模式没有解析思考的授权，模型说什么就展示什么")
+                .isEqualTo("正文" + THINK_OPEN + "标签原文");
     }
 
     @Test

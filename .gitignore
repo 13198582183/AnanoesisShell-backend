@@ -37,3 +37,6 @@ logs/
 compile-*.txt
 test-*.txt
 .tmp-*
+
+# ---- 误生成的 vite 依赖缓存（工具链在 backend 目录跑 vite 时产生）----
+.vite/

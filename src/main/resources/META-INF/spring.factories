@@ -1,0 +1,6 @@
+# EnvironmentPostProcessor 注册必须走 spring.factories：
+# Boot 3.x 对 EPP 仍用 SpringFactoriesLoader 读取该文件（.imports 机制仅覆盖
+# AutoConfiguration）；写错渠道不会报错，只会静默不生效——health show-details
+# 泄露组件细节的集成测试正是这样抓出来的。
+org.springframework.boot.env.EnvironmentPostProcessor=\
+com.ananoesis.shell.desktop.DesktopGuardEnvironmentPostProcessor

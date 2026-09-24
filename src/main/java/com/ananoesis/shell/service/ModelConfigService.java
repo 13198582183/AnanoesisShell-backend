@@ -268,9 +268,13 @@ public class ModelConfigService {
     }
 
     /**
-     * 删除配置及其凭据。
+     * 删除配置及其凭据；目标是生效配置时，一并清除生效指针。
      *
-     * @throws ConflictException 目标是当前生效配置（TRACEABILITY Q4）
+     * <p>WHY 删除生效配置放行而不是拒绝（历史上的 409）：首条配置自动生效，
+     * 「只剩一条」必然「它就是生效项」，拒绝删除生效配置意味着用户永远删不掉
+     * 最后一条——而零配置本就是空库首启的合法初始态：{@link #requireActive()}
+     * 对此报「尚无生效的模型配置」的可读引导，界面也有对应的缺配置提示，
+     * AI 能力并不会静默失效。契约同步修订见 TRACEABILITY R11。</p>
      */
     @Transactional
     public void delete(UUID id) {
@@ -280,9 +284,9 @@ public class ModelConfigService {
 
         Optional<String> activeId = activeConfigId();
         if (activeId.isPresent() && activeId.get().equals(configId)) {
-            // WHY 409 而不是 400：请求本身没有任何问题，是资源的当前状态不允许删除。
-            // 若放行，系统里就不再有生效配置，AI 能力会在没有界面提示的情况下静默失效。
-            throw new ConflictException("该模型配置正在生效，请先切换到其它配置再删除");
+            // 不留悬空指针：否则 findActive 会指向已不存在的配置，错误现场远比空态难查
+            settingsService.deleteKey(ACTIVE_CONFIG_KEY);
+            LOG.info("已删除生效模型配置，生效指针同步清空: id={}", configId);
         }
 
         // 孤立密文既占空间，又让"这个 key 属于谁"的审计问题出现无解的行

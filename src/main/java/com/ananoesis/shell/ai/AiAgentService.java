@@ -659,6 +659,9 @@ public class AiAgentService {
     private RoundResult streamRound(ChatModel model, List<Message> prompt,
                                     UUID conversationId, boolean thinking) {
         RoundResult result = new RoundResult();
+        // 仅思考模式启用内联标签分流：与 reasoningContent 同口径，非思考模式
+        // 没有解析思考的授权，模型输出什么就透传什么（回归用例钉住）
+        InlineThinkTagParser inlineThink = thinking ? new InlineThinkTagParser() : null;
         for (ChatResponse chunk : model.stream(new Prompt(prompt)).toIterable()) {
             if (stopRequested.contains(conversationId)) {
                 // 流式读期间停止：立即中断消费，不把半截回答继续推给前端（BUG-B）
@@ -676,8 +679,14 @@ public class AiAgentService {
             if (output != null) {
                 String delta = output.getText();
                 if (delta != null && !delta.isEmpty()) {
-                    result.text.append(delta);
-                    emit(AiStreamFrame.answerDelta(conversationId, delta));
+                    if (inlineThink == null) {
+                        result.text.append(delta);
+                        emit(AiStreamFrame.answerDelta(conversationId, delta));
+                    } else {
+                        for (InlineThinkTagParser.Segment segment : inlineThink.feed(delta)) {
+                            emitSegment(segment, conversationId, result);
+                        }
+                    }
                 }
                 if (thinking) {
                     Object reasoning = output.getMetadata() == null
@@ -699,7 +708,25 @@ public class AiAgentService {
                 }
             }
         }
+        // 回合结束先吐待定尾：未闭合标签的余文归思考，不凭空丢字
+        if (inlineThink != null) {
+            for (InlineThinkTagParser.Segment segment : inlineThink.flush()) {
+                emitSegment(segment, conversationId, result);
+            }
+        }
         return result;
+    }
+
+    /** 把一个内联标签分流段路由到对应帧型与累积器（思考走 thinking_delta，其余走 answer_delta）。 */
+    private void emitSegment(InlineThinkTagParser.Segment segment, UUID conversationId,
+                             RoundResult result) {
+        if (segment.thinking()) {
+            result.reasoning.append(segment.text());
+            emit(AiStreamFrame.thinkingDelta(conversationId, segment.text()));
+        } else {
+            result.text.append(segment.text());
+            emit(AiStreamFrame.answerDelta(conversationId, segment.text()));
+        }
     }
 
     // ==================================================================
